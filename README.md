@@ -1,3 +1,7 @@
+#  
+
+所有问题的答案都写在对应assignment下的 answer.md 中。（个人观点）
+
 # Weiming HPC Training Camp x LCPU AI Infra Seminars
 
 北京大学未名超算队（The Radiance of Weiming）与北京大学学生 Linux 俱乐部（LCPU）合办的暑期 AI Infra 系列活动仓库。每次 session 的作业与配套代码放在对应的 `assignmentXX/` 目录。
