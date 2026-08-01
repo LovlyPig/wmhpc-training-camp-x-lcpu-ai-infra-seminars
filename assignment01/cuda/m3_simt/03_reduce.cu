@@ -40,10 +40,61 @@
 
 __global__ void reduce_interleaved(const float *in, float *out) {
     // TODO：从这里开始写（交错配对版本）
+    __shared__ float buf[BLOCK];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+    buf[tid] = in[idx];
+    __syncthreads();
+
+    for (int s = 1; s < blockDim.x; s *= 2) {
+        if (tid % (2*s) == 0)
+            buf[tid] = buf[tid] + buf[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0)
+        out[blockIdx.x] = buf[0];
 }
 
 __global__ void reduce_contiguous(const float *in, float *out) {
     // TODO：从这里开始写（连续配对版本）
+    __shared__ float buf[BLOCK];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+    buf[tid] = in[idx];
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s /=2) {
+        if (tid < s) {
+            buf[tid] = buf[tid] + buf[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0)
+        out[blockIdx.x] = buf[0];
+}
+
+__global__ void reduce_shfl(const float *in, float *out) {
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+    
+    float val = in[idx];
+    for (int s = 1; s < 32; s *= 2)
+        val += __shfl_down_sync(0xffffffff, val, s);
+
+    __shared__ float warp_sum[32];
+    if ((tid & 31) == 0) // 注意 == 的优先级更高
+        warp_sum[tid / 32] = val;
+    __syncthreads();
+
+    if (tid == 0) {
+        float sum = 0.0;
+        for (int i = 0; i < (blockDim.x + 31) / 32; ++i)
+            sum += warp_sum[i];
+        out[blockIdx.x] = sum;
+    }
+        
 }
 
 // ---------------- 以下是判测与计时，不要修改 ----------------
@@ -98,7 +149,11 @@ int main() {
                          h_partial, nblocks);
     float ms_c = run_one(reduce_contiguous, "contiguous ", d_in, d_out, h_out,
                          h_partial, nblocks);
-    // 阈值 1.5x：A100 实测 2.22x、V100 实测 2.33x，两版写成一样时是 ~1x。
+
+    float ms_s = run_one(reduce_shfl, "shuffle     ", d_in, d_out, h_out,
+                         h_partial, nblocks);
+    printf("shuffle / contiguous = %.3f\n", ms_s / ms_c);
+                         // 阈值 1.5x：A100 实测 2.22x、V100 实测 2.33x，两版写成一样时是 ~1x。
     float ratio = report_speedup("interleaved / contiguous", ms_i, ms_c, 1.5f,
                                  "两版耗时几乎一样，检查是不是写成同一个实现了");
 
