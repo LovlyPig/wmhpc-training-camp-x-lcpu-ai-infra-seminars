@@ -603,11 +603,17 @@ __global__ void reduce_shfl(const float *in, float *out) {
 ## prob 4.1
 
 空间        谁可见         生命周期    片上/片外        谁管理
+
 register    单个线程        线程        片上            编译器
+
 local       单个线程        线程        片外（但被缓存） 编译器
+
 shared   同一线程块上的线程  线程块     片上            用户
+
 global      所有线程        核函数      片外            用户
+
 constant    所有线程（只读） 核函数     片外            用户
+
 L1/L2 cache    所有线程     核函数      片上            硬件
 
 ## prob 4.2
@@ -643,5 +649,137 @@ __constant__ float COEF[8];
 
 ## prob 4.5
 
+```C++
+atomicAdd(&hist[v], 1);
+```
+平均耗时 5.0198 ms  (3.34 GB/s)
 
+## prob 4.6
 
+测试结果包含与 naive 实现相比较的耗时、吞吐。试解释提速来自哪里。
+
+答：
+测试结果：
+
+naive: PASS  平均 4.7454 ms  (3.54 GB/s)
+
+priv : PASS  平均 0.0685 ms  (244.89 GB/s)
+
+naive / priv = 69.27x
+
+首先，naive版本所有线程竞争hist数组的写入，竞争激烈，导致写入过程几乎串行化，所以吞吐很低；优化版每个block的线程竞争自己的共享内存的写入，竞态相对减小。其次，每次将结果写入hist数组对于global memory的访问是随机的，不能合并访问；优化版先写入共享内存，再统一写入全局内存，一个warp内的线程写入地址是连续的可以合并写入。
+
+```C++
+__global__ void histogram_priv(const unsigned char *data, unsigned int *hist,
+                               int n) {
+    // TODO：从这里开始写（shared memory 私有化版本）
+    __shared__ uint32_t local_hist[BINS];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    local_hist[threadIdx.x] = 0;
+    __syncthreads();
+
+    int stride = blockDim.x * gridDim.x;
+    for (; i < n; i += stride) {
+        atomicAdd(&local_hist[data[i]], 1u);
+    }
+
+    __syncthreads();
+    atomicAdd(&hist[threadIdx.x], local_hist[threadIdx.x]); 
+}
+```
+
+## prob 4.7
+
+stride           ms         GB/s
+
+1       0.6612        203.0
+
+2       1.0097        132.9
+
+4       1.6114         83.3
+
+8       2.9332         45.8
+
+16       2.7606         48.6
+
+32       2.7420         48.9
+
+观察数据变化趋势，并简析趋势的成因。
+
+stride从1至8，执行时间逐步上升，吞吐量逐步降低；从8至16、32，执行时间略有降低，吞吐量略微提升，但是16与32的数据可以认为是稳定的。
+
+```C++
+__global__ void strided_copy(const float *in, float *out, int n, int stride) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        int j = (long)i * stride & (n - 1);
+        out[i] = in[j];
+    }
+}
+```
+观察核函数可以发现，stride改变的是同一warp内的线程访问的全局内存的地址。当stride为1时，warp内线程访问连续地址，可以合并为一次访存事务，所以速度最快；当stride依次增长为2、4、8；访存事务逐步变为2次、4次和8次，所以性能逐步降低。现代NVIDIA GPU的L2缓存行大小为32字节，当stride大于8时，一个warp的访问已经完全覆盖32个不同的缓存行，因此内存事务已达到硬件在此粒度下的最大值，所以性能没有继续恶化；stride=8显然会发生bank conflict，所有数据都落在同一个bank，而16、32分别是2-way和4-way相对更好，所以略快一点。
+
+## prob 4.8
+
+请回答：(a) 用程序开头打印的“shared memory / SM”和“最大常驻线程 / SM”，手算其中一个的驻留 block 数和 occupancy，和 API 的结果对照。(b) 带宽为什么随 occupancy 下降？用“延迟隐藏需要足够多的常驻 warp”组织你的解释。(c) 表中带宽随 occupancy 单调下降，但明显不成正比——从 100% 到 75% 带宽掉了多少？从 37.5% 到 12.5% 又掉了多少？试解释这个差别。
+
+```
+NVIDIA GeForce RTX 4060 Laptop GPU：shared memory 100 KB / SM，最大常驻 1536 线程 / SM
+
+shared/block   理论 block/SM  occupancy   实测带宽
+     0.0 KB          6          100.0%      156.9 GB/s
+    13.2 KB          6          100.0%      157.1 GB/s
+    15.0 KB          6          100.0%      160.1 GB/s
+    18.0 KB          5           83.3%      172.8 GB/s
+    29.0 KB          3           50.0%      195.9 GB/s
+    55.0 KB          1           16.7%      129.0 GB/s
+
+cudaOccupancyMaxPotentialBlockSize 建议（smem = 0 时）：blockSize = 768
+```
+
+答：
+a）分配15KB shared/block，该设备 shared memory 100KB/SM，则理论 block/SM 为 100KB/15KB = 6，最大常驻 1536 线程/SM，目前最多有6 * 256 = 1536个线程正好满足所以100% occupancy。
+
+b）当一部分warp在等待全局内存访存时，SM通过切换其他活跃warp来掩盖访存时间（零开销），所以足够多的驻留warp才能有效延迟隐藏。occupancy降低意味着驻留warp数降低，一旦所有活跃warp都陷入内存访问等待，SM就被迫stall，带宽自然就降低了。
+
+理论上确实应该是这样，但是从实测数据发现并不是，occupancy在50%时带宽最大，，同时occupancy在83.3%时的带宽也大于occupancy 100%时。由此可见occupancy越大并不能一定代表性能越好。当为了延迟隐藏而切换warp时，过多的数据访存导致内存总线被过度拥挤，而适当的warp数是内存控制器能高效流水线化处理的最佳请求深度。
+
+c）
+
+# 5
+## prob 5.1
+
+回答下列问题：(a) 哪个数值可以当作 kernel 耗时写进报告？(b) 另外两个各具体测的是什么？
+
+host 计时、不等 GPU :     0.0179 ms;
+host 计时、等 GPU   :     0.6480 ms;
+cudaEvent 计时      :     0.5601 ms;
+
+答：a）cudaEvent 计时可以作为 kernel 耗时记录
+
+b）host计时、不等GPU 测的是 核函数启动的时间；host计时、等GPU 测的是 kernel时间加上host和device的同步时间
+
+## prob 5.2
+
+判断对错，可以顺带补一句理由。
+
+(a) 同一个 stream 里的操作按提交顺序执行。
+
+(b) kernel 启动后，host 代码立刻继续往下执行。
+
+(c) unified memory 下，CPU 访问一页正被 GPU 占用的内存，会触发缺页与页迁移。
+
+答：a）对；b）对；c）对。因为页面在GPU端，所以会触发缺页，OS捕获到这个异常后，系统启动页迁移，通过PCIe等总线将数据从GPU显存拷贝回CPU。
+
+# 6
+## prob 6.1
+
+判断对错，可以顺带补一句理由。
+
+(a) tile 是显存里的一块可变区域，kernel 通过指针直接改写它。
+
+(b) 对 tile 的一次运算（如两个 tile 相加）由编译器映射到 block 内的多个线程上执行。
+
+(c) tile 模型与 SIMT 模型互斥，一个 CUDA 程序只能选一种。
+
+答：a）

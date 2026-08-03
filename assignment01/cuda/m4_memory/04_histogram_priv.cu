@@ -7,6 +7,7 @@
 //   3. 同步之后，把 shared 直方图的 256 个 bucket 用 atomicAdd 汇入全局直方图。
 // 两版都要 PASS。评测结果会包含两版的耗时和比值，解释提速来自哪里。
 #include "common.h"
+#include <stdint.h>
 
 #define BINS 256
 
@@ -22,6 +23,18 @@ __global__ void histogram_naive(const unsigned char *data, unsigned int *hist,
 __global__ void histogram_priv(const unsigned char *data, unsigned int *hist,
                                int n) {
     // TODO：从这里开始写（shared memory 私有化版本）
+    __shared__ uint32_t local_hist[BINS];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    local_hist[threadIdx.x] = 0;
+    __syncthreads();
+
+    int stride = blockDim.x * gridDim.x;
+    for (; i < n; i += stride) {
+        atomicAdd(&local_hist[data[i]], 1u);
+    }
+
+    __syncthreads();
+    atomicAdd(&hist[threadIdx.x], local_hist[threadIdx.x]); 
 }
 
 // ---------------- 以下是判测与计时，不要修改 ----------------
