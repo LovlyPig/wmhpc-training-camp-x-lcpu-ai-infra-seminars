@@ -23,6 +23,71 @@ import torch
 import tilelang
 import tilelang.language as T
 
+_softmax_kernel_cache = {}
+
+
+def _next_power_of_2(n: int) -> int:
+    if n <= 1:
+        return 1
+    if n & (n - 1) == 0:
+        return n
+    return 1 << (n - 1).bit_length()
+
+
+def make_softmax_kernel(M: int, N: int):
+    cache_key = (M, N)
+    if cache_key in _softmax_kernel_cache:
+        return _softmax_kernel_cache[cache_key]
+
+    padded_N = _next_power_of_2(N)
+    threads = 128
+
+    @T.prim_func
+    def kernel(X: T.Tensor((M, N), T.float32), Y: T.Tensor((M, N), T.float32)):
+        with T.Kernel(M, threads=threads) as row:
+            x = T.alloc_fragment((1, padded_N), T.float32)
+            exp_vals = T.alloc_fragment((1, padded_N), T.float32)
+            row_max = T.alloc_fragment((1,), T.float32)
+            row_sum = T.alloc_fragment((1,), T.float32)
+
+            # 1) 读入一行：有效位置读 X，越界位置补 -inf
+            # 必须用 if/else 语句，不能用 T.if_then_else 表达式，
+            # 否则 j>=N 时 X[row, j] 仍可能被求值导致越界读。
+            for _, j in T.Parallel(1, padded_N):
+                if j < N:
+                    x[0, j] = X[row, j]
+                else:
+                    x[0, j] = -T.infinity(T.float32)
+
+            # 2) 行内求 max（数值稳定）
+            T.reduce_max(x, row_max, dim=1, clear=True)
+
+            # 3) 逐元素 exp(x - max)
+            for _, j in T.Parallel(1, padded_N):
+                exp_vals[0, j] = T.exp(x[0, j] - row_max[0])
+
+            # 4) 行内求和
+            T.reduce_sum(exp_vals, row_sum, dim=1, clear=True)
+
+            # 5) 归一化写回：迭代数取 padded_N 保证是 threads 的整数倍，
+            # 再用 if j < N 跳过无效位置，避免 T.Parallel(1, N) 的静默错误。
+            for _, j in T.Parallel(1, padded_N):
+                if j < N:
+                    Y[row, j] = exp_vals[0, j] / row_sum[0]
+
+    compiled = tilelang.compile(kernel, out_idx=[1], target="cuda")
+    _softmax_kernel_cache[cache_key] = compiled
+    return compiled
+
 
 def softmax(x: torch.Tensor) -> torch.Tensor:
-    raise NotImplementedError("从这里开始写")
+    if not x.is_cuda:
+        raise ValueError("Input tensor must be on CUDA")
+    if x.dtype != torch.float32:
+        raise ValueError("Input tensor must be float32")
+
+    M, N = x.shape
+    x = x.contiguous()
+
+    kernel = make_softmax_kernel(M, N)
+    return kernel(x)
